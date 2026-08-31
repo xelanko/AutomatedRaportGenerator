@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  report_generator:
+    build: .
+    volumes:
+      - ./data:/api/data
+      - ./output:/api/output
+      - ./logs:/api/logs
+    environment:
+      - REPORT_SCHEDULE_CRON=0 7 * * MON
+      - REPORT_LOG_LEVEL=INFO

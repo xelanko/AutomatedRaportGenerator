@@ -1,0 +1,153 @@
+"""
+FastAPI service exposing the Automated Report Generator over HTTP.
+
+Run locally with:
+    uvicorn api:app --reload --host 0.0.0.0 --port 8000
+
+Then visit http://localhost:8000/docs for interactive Swagger docs.
+
+Endpoints:
+    GET    /health                 - liveness check
+    POST   /reports/generate       - run the pipeline and generate a new report
+    GET    /reports                - list previously generated report files
+    GET    /reports/{filename}     - download a specific report file (pdf/xlsx)
+    DELETE /reports/{filename}     - delete a specific report file
+"""
+from datetime import date
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+import config
+import logger_setup
+from data_sources import csv_source, sql_source
+from pipeline import run_pipeline
+
+log = logger_setup.get_logger(__name__)
+
+app = FastAPI(
+    title="Report Generator API",
+    description="Trigger and retrieve automated sales reports",
+    version="1.0.0",
+)
+
+
+class GenerateRequest(BaseModel):
+    title: str = "Monthly Sales Report"
+    period_start: date
+    period_end: date
+    allowed_regions: list[str] = ["North", "South", "East", "West"]
+    allowed_categories: list[str] = ["Electronics", "Furniture", "Clothing"]
+    expected_total_revenue: Optional[float] = None
+    use_sql_source: bool = True
+
+
+class GenerateResponse(BaseModel):
+    title: str
+    generated_at: str
+    total_records: int
+    validation_errors: int
+    validation_warnings: int
+    pdf_filename: str
+    xlsx_filename: str
+    issue_messages: list[str]
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/reports/generate", response_model=GenerateResponse)
+def generate_report(req: GenerateRequest):
+    """Run the extraction -> validation -> export pipeline and produce a new report."""
+    csv_path = config.DATA_DIR / "sales.csv"
+    if not csv_path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"No CSV data found at {csv_path}. Run `python main.py setup-sample` first, "
+                   f"or place your own sales.csv there.",
+        )
+
+    try:
+        records = csv_source.extract(csv_path)
+        if req.use_sql_source:
+            records += sql_source.extract()
+    except Exception as e:
+        log.error(f"Extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {e}")
+
+    try:
+        result = run_pipeline(
+            raw_records=records,
+            report_title=req.title,
+            period_start=req.period_start,
+            period_end=req.period_end,
+            allowed_regions=set(req.allowed_regions),
+            allowed_categories=set(req.allowed_categories),
+            expected_total_revenue=req.expected_total_revenue,
+        )
+    except Exception as e:
+        log.error(f"Pipeline failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Pipeline failed: {e}")
+
+    metadata = result["metadata"]
+    return GenerateResponse(
+        title=metadata.title,
+        generated_at=metadata.generated_at.isoformat(),
+        total_records=metadata.total_records,
+        validation_errors=metadata.validation_error_count,
+        validation_warnings=metadata.validation_warning_count,
+        pdf_filename=result["pdf_path"].name,
+        xlsx_filename=result["xlsx_path"].name,
+        issue_messages=[i.message for i in result["issues"]],
+    )
+
+
+@app.get("/reports")
+def list_reports():
+    """List all report files currently in the output directory."""
+    files = sorted(
+        [f for f in config.OUTPUT_DIR.iterdir() if f.is_file() and f.suffix in (".pdf", ".xlsx")],
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+    return {
+        "count": len(files),
+        "reports": [
+            {"filename": f.name, "size_bytes": f.stat().st_size, "modified": f.stat().st_mtime}
+            for f in files
+        ],
+    }
+
+
+@app.get("/reports/{filename}")
+def download_report(filename: str):
+    """Download a previously generated report file by name."""
+    file_path = (config.OUTPUT_DIR / filename).resolve()
+    if config.OUTPUT_DIR.resolve() not in file_path.parents:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    media_type = (
+        "application/pdf" if file_path.suffix == ".pdf"
+        else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    return FileResponse(path=file_path, filename=file_path.name, media_type=media_type)
+
+
+@app.delete("/reports/{filename}")
+def delete_report(filename: str):
+    """Delete a report file by name."""
+    file_path = (config.OUTPUT_DIR / filename).resolve()
+    if config.OUTPUT_DIR.resolve() not in file_path.parents:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    file_path.unlink()
+    log.info(f"Deleted report {file_path}")
+    return {"deleted": filename}
